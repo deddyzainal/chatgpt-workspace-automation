@@ -1,4 +1,5 @@
 import { test, expect, Locator } from '@playwright/test';
+import { getUserAccount } from './users.config';
 
 /**
  * This test uses the saved authentication state from auth.setup.ts
@@ -19,7 +20,17 @@ import { test, expect, Locator } from '@playwright/test';
  * - chromium-user1 (uses playwright/.auth/user1.json)
  * - etc. (one project per auth file)
  */
-test('visit chatgpt.com (already authenticated)', async ({ page }) => {
+test('visit chatgpt.com (already authenticated)', async ({ page }, testInfo) => {
+  test.setTimeout(60000);
+  // Get user email from project name
+  // Project name format: chromium-{userId} (e.g., chromium-admin, chromium-user1)
+  const projectName = testInfo.project.name;
+  const userId = projectName.replace('chromium-', '');
+  const userAccount = getUserAccount(userId);
+  const userEmail = userAccount?.email || userId; // Fallback to userId if user not found
+  
+  // Track deleted emails
+  const deletedEmails: string[] = [];
   // Navigate to ChatGPT - should already be logged in via storage state
   await page.goto('https://chatgpt.com/admin', { waitUntil: 'networkidle' });
   
@@ -28,21 +39,13 @@ test('visit chatgpt.com (already authenticated)', async ({ page }) => {
   await workspaceHeading.waitFor({ state: 'visible', timeout: 10000 });
   await workspaceHeading.click();
 
-  await page.goto('https://chatgpt.com/admin', { waitUntil: 'networkidle' });
-  
-  // Wait for and click Members button
-  const membersButton = page.locator('//div[contains(text(),"Members")]');
-  await membersButton.waitFor({ state: 'visible', timeout: 10000 });
-  await membersButton.click();
+  await page.goto('https://chatgpt.com/admin/members', { waitUntil: 'networkidle' });
   
   // Wait for Members heading to be visible
   const membersHeading = page.getByRole('heading', { name: 'Members' });
   await membersHeading.waitFor({ state: 'visible', timeout: 10000 });
   await expect(membersHeading).toBeVisible();
-  
-  // Wait for the table to load
-  await page.waitForSelector('table tr, tbody tr', { timeout: 10000 });
-  
+    
   // Loop to find and delete rows with emails that don't contain "hinedigitals.store"
   let deletedCount = 0;
   let maxIterations = 100; // Safety limit to prevent infinite loops
@@ -52,7 +55,7 @@ test('visit chatgpt.com (already authenticated)', async ({ page }) => {
     iteration++;
     
     // Wait for table to be visible before finding rows
-    await page.waitForSelector('table tr, tbody tr', { state: 'visible', timeout: 5000 });
+    await page.waitForSelector('table tr, tbody tr', { state: 'visible', timeout: 30000 });
     
     // Find all table rows
     const rows = await page.locator('table tr, tbody tr').all();
@@ -74,14 +77,50 @@ test('visit chatgpt.com (already authenticated)', async ({ page }) => {
         }
         
         // Try to find email pattern in row text
-        const emailMatch = rowText.match(/[\w\.-]+@[\w\.-]+\.\w+/);
+        // Use a precise regex that matches complete email addresses
+        // Pattern: word characters, dots, hyphens @ word characters, dots, hyphens . 2+ letters (TLD)
+        // Try multiple patterns to handle different text formats
         
-        if (emailMatch) {
-          const email = emailMatch[0];
-          // Check if email doesn't contain "hinedigitals.store"
-          if (!email.includes('hinedigitals.store')) {
-            foundRow = row;
-            rowEmail = email;
+        // First, try with word boundaries (works when email is separated by spaces/punctuation)
+        let emailRegex = /\b([\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,})\b/g;
+        let emailMatches = [...rowText.matchAll(emailRegex)];
+        
+        // If no matches with word boundaries, try without word boundaries
+        // This handles cases where text is concatenated like "email@gmail.comMemberNov"
+        if (emailMatches.length === 0) {
+          emailRegex = /([\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,})/g;
+          emailMatches = [...rowText.matchAll(emailRegex)];
+        }
+        
+        if (emailMatches && emailMatches.length > 0) {
+          // Process all matches and find the first valid email
+          for (const match of emailMatches) {
+            // match[1] contains the captured email (group 1)
+            let email = match[1].trim();
+            
+            // Extract only the email part - find where the email ends
+            // The email should end with a TLD (2+ letters), followed by non-word character or end
+            // If there's text immediately after the TLD, extract only up to the TLD
+            const emailEndMatch = email.match(/^([\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,})/);
+            if (emailEndMatch) {
+              email = emailEndMatch[1];
+            }
+            
+            // Validate it's a complete email address (not concatenated with other text)
+            // Check that the email matches the full email pattern exactly
+            const emailValidation = /^[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}$/;
+            if (emailValidation.test(email)) {
+              // Check if email doesn't contain "hinedigitals.store"
+              if (!email.includes('hinedigitals.store')) {
+                foundRow = row;
+                rowEmail = email;
+                break;
+              }
+            }
+          }
+          
+          // If we found a valid row, break out of the row loop
+          if (foundRow) {
             break;
           }
         }
@@ -136,6 +175,7 @@ test('visit chatgpt.com (already authenticated)', async ({ page }) => {
         }
         
         deletedCount++;
+        deletedEmails.push(rowEmail);
         console.log(`Successfully deleted row with email: ${rowEmail}. Total deleted: ${deletedCount}`);
       } catch (verifyError) {
         console.log(`Warning: Could not verify deletion of ${rowEmail}. Row may still exist.`);
@@ -146,6 +186,7 @@ test('visit chatgpt.com (already authenticated)', async ({ page }) => {
         // Wait for table to load again
         await page.waitForSelector('table tr, tbody tr', { state: 'visible', timeout: 10000 });
         deletedCount++;
+        deletedEmails.push(rowEmail);
       }
       
       // Wait a bit for any animations or UI updates to complete
@@ -180,5 +221,15 @@ test('visit chatgpt.com (already authenticated)', async ({ page }) => {
   }
   
   console.log(`Completed. Total rows deleted: ${deletedCount}`);
+  
+  // Log result in specified format
+  const status = deletedEmails.length === 0 ? 'clean' : 'dirty';
+  const cleanedEmails = deletedEmails.length > 0 ? deletedEmails.join(', ') : 'no anomalies data';
+  const result = 'success';
+  
+  console.log(`\n${'='.repeat(80)}`);
+  console.log(`SCRAPE RESULT:`);
+  console.log(`${userEmail} | ${status} | ${cleanedEmails} | ${result}`);
+  console.log(`${'='.repeat(80)}\n`);
 });
 
